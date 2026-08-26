@@ -1,0 +1,9 @@
+:root { font-family: system-ui, sans-serif; line-height: 1.5; }
+body { margin: 0 auto; max-width: 960px; padding: 1rem; }
+header { border-bottom: 1px solid #ddd; margin-bottom: 1rem; }
+section { border: 1px solid #eee; border-radius: 6px; padding: 1rem; margin: 1rem 0; }
+button { margin-right: 0.5rem; padding: 0.4rem 0.8rem; cursor: pointer; }
+.list { list-style: none; padding-left: 0; }
+.list li { padding: 0.25rem 0; border-bottom: 1px dotted #eee; }
+.connected { color: #1a7f37; }
+.disconnected { color: #b42318; }
