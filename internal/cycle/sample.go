@@ -47,8 +47,11 @@ func (s *Service) Sample(ctx context.Context, req SampleRequest) error {
 		}
 
 		// A late sample from an old generation only enters the audit timeline.
+		// The operation is recorded for idempotency so a resent late sample with
+		// the same operation id and content is recognized as a replay instead of
+		// appending a duplicate audit event and advancing the cursor again.
 		if req.ExpectedGeneration < state.generation {
-			return s.recordAudit(ctx, tx, req.CycleID, state, domain.Digest("stale-sample", requestDigest))
+			return s.recordAudit(ctx, tx, req.CycleID, req.OperationID, requestDigest, state)
 		}
 		if req.ExpectedGeneration > state.generation {
 			return domain.NewError(domain.CodeGenerationMismatch, req.OperationID, false, "sample generation ahead of cycle")
@@ -111,8 +114,11 @@ func (s *Service) Sample(ctx context.Context, req SampleRequest) error {
 }
 
 // recordAudit appends a non-advancing audit event so a stale-generation sample
-// is visible in the timeline but does not change the current projection.
-func (s *Service) recordAudit(ctx context.Context, tx *store.Tx, cycleID domain.CycleID, state cycleState, digest string) error {
+// is visible in the timeline but does not change the current projection. It also
+// records an idempotency entry for the operation so a resent identical late
+// sample is replayed (returns nil) instead of appending a duplicate audit event
+// and advancing the cursor again.
+func (s *Service) recordAudit(ctx context.Context, tx *store.Tx, cycleID domain.CycleID, op domain.OperationID, requestDigest string, state cycleState) error {
 	seq := state.cursor + 1
 	ev := domain.CycleEvent{
 		CycleID:     cycleID,
@@ -120,11 +126,19 @@ func (s *Service) recordAudit(ctx context.Context, tx *store.Tx, cycleID domain.
 		Sequence:    seq,
 		Phase:       state.phase,
 		LogicalTime: state.lastTime,
-		InputDigest: digest,
+		OperationID: op,
+		InputDigest: requestDigest,
 		Audit:       true,
 	}
 	if err := tx.AppendEvent(ctx, ev); err != nil {
 		return err
 	}
-	return saveSnapshot(ctx, tx, cycleID, state.validationID, state.generation, seq, state.status)
+	if err := saveSnapshot(ctx, tx, cycleID, state.validationID, state.generation, seq, state.status); err != nil {
+		return err
+	}
+	return tx.RecordIdempotency(ctx, domain.IdempotencyRecord{
+		OperationID:    op,
+		RequestDigest:  requestDigest,
+		ResponseDigest: "audit",
+	})
 }
