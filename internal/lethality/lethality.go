@@ -7,6 +7,7 @@ package lethality
 import (
 	"context"
 	"errors"
+	"strconv"
 
 	"lyophilizer-sterilization-validation/internal/domain"
 	"lyophilizer-sterilization-validation/internal/store"
@@ -40,30 +41,68 @@ type CalculateRequest struct {
 
 // Calculate runs the deterministic judgment for a cycle over one event cursor
 // and appends results atomically, refusing to write any partial position result
-// when a sample is missing, out of range, or overflows.
+// when a sample is missing, out of range, or overflows. A retry with the same
+// operation id replays the originally recorded result instead of recomputing,
+// so a client that times out and retries observes identical, stable output.
 func (s *Service) Calculate(ctx context.Context, req CalculateRequest) ([]domain.CalculationResult, error) {
 	results, err := s.compute(ctx, req.CycleID)
 	if err != nil {
 		return nil, err
 	}
 
+	// The request digest summarizes the cycle being judged, so a retry of the
+	// same operation against different content is rejected as a conflict.
+	requestDigest := domain.Digest("calculate", req.CycleID, results[0].generation,
+		len(results), AlgorithmVersion)
+
+	var out []domain.CalculationResult
 	err = s.store.InTx(ctx, func(tx *store.Tx) error {
+		// Idempotent replay of the same operation returns the recorded result.
+		if rec, err := tx.GetIdempotency(ctx, req.OperationID); err == nil {
+			if rec.RequestDigest != requestDigest {
+				return domain.NewError(domain.CodeIdempotencyConflict, req.OperationID, false, "operation reused with different content")
+			}
+			generation := parseGeneration(rec.ResponseDigest)
+			stored, err := tx.ListCalculations(ctx, req.CycleID, generation)
+			if err != nil {
+				return err
+			}
+			out = stored
+			return nil
+		} else if !errors.Is(err, store.ErrNotFound) {
+			return err
+		}
+
 		for _, r := range results {
 			if err := tx.InsertCalculation(ctx, req.CycleID, r.generation, r.CalculationResult); err != nil {
 				return err
 			}
+		}
+		if err := tx.RecordIdempotency(ctx, domain.IdempotencyRecord{
+			OperationID:    req.OperationID,
+			RequestDigest:  requestDigest,
+			ResponseDigest: strconv.FormatInt(int64(results[0].generation), 10),
+		}); err != nil {
+			return err
+		}
+
+		out = make([]domain.CalculationResult, len(results))
+		for i, r := range results {
+			out[i] = r.CalculationResult
 		}
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
-
-	out := make([]domain.CalculationResult, len(results))
-	for i, r := range results {
-		out[i] = r.CalculationResult
-	}
 	return out, nil
+}
+
+// parseGeneration decodes a generation stored as an idempotency response
+// digest back into a typed generation.
+func parseGeneration(s string) domain.Generation {
+	n, _ := strconv.ParseInt(s, 10, 64)
+	return domain.Generation(n)
 }
 
 // Results returns the computed results with input intervals for a cycle.
