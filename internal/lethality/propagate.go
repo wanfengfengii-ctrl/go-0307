@@ -87,7 +87,21 @@ func (s *Service) OpenRetest(ctx context.Context, req RetestRequest) (domain.Gen
 				return nil
 			}
 		}
-		retestGeneration = generation + 1
+		// Each distinct propagation summary gets its own strictly increasing
+		// retest generation, independent of the cycle's current generation.
+		// Basing the next generation only on the snapshot generation would hand
+		// every retest the same value (generation+1), so two retests opened
+		// from different sources would share a generation and their members
+		// would be indistinguishable. Floor at the cycle generation so the first
+		// retest stays generation+1, then advance past any existing retest
+		// generation already assigned to this cycle.
+		maxRetest := generation
+		for _, d := range deviations {
+			if d.RetestGeneration > maxRetest {
+				maxRetest = d.RetestGeneration
+			}
+		}
+		retestGeneration = maxRetest + 1
 		dev := domain.DeviationCase{
 			ID:               domain.DeviationID("dev-" + summary[:16]),
 			CycleID:          req.CycleID,
