@@ -188,43 +188,34 @@ func (s *Service) Acquire(ctx context.Context, req LeaseRequest) (domain.TokenID
 	return token, nil
 }
 
-// Renew extends a lease held by the same token.
+// Renew extends a lease held by the same token. The read, overlap check and
+// extension run in one transaction so that a LEASE_CONFLICT against the new
+// interval leaves the existing lease untouched; a delete-then-reinsert split
+// would commit the deletion before the conflict check and lose the token.
 func (s *Service) Renew(ctx context.Context, token domain.TokenID, until domain.LogicalTime) error {
-	var l domain.ResourceLease
-	err := s.store.Read(ctx, func(tx *store.Tx) error {
-		var err error
-		l, err = tx.GetLease(ctx, token)
-		return err
-	})
-	if errors.Is(err, store.ErrNotFound) {
-		return domain.NewError(domain.CodeNotFound, "", false, "lease not found")
-	}
-	if err != nil {
-		return err
-	}
-	if until <= l.ValidFrom {
-		return domain.NewError(domain.CodeNegativeInterval, "", false, "renewal endpoint before lease start")
-	}
-
-	if err := s.store.InTx(ctx, func(tx *store.Tx) error {
-		return tx.DeleteLease(ctx, token)
-	}); err != nil {
-		return err
-	}
-
-	l.ValidUntil = until
 	return s.store.InTx(ctx, func(tx *store.Tx) error {
-		overlap, err := tx.HasOverlappingLease(ctx, l.ResourceID, l.ValidFrom, l.ValidUntil, token)
+		l, err := tx.GetLease(ctx, token)
 		if errors.Is(err, store.ErrNotFound) {
 			return domain.NewError(domain.CodeNotFound, "", false, "lease not found")
 		}
 		if err != nil {
 			return err
 		}
+		if until <= l.ValidFrom {
+			return domain.NewError(domain.CodeNegativeInterval, "", false, "renewal endpoint before lease start")
+		}
+
+		// Verify the extended [ValidFrom, until) interval does not collide with
+		// another lease before mutating the row, so the original lease survives a
+		// conflict.
+		overlap, err := tx.HasOverlappingLease(ctx, l.ResourceID, l.ValidFrom, until, token)
+		if err != nil {
+			return err
+		}
 		if overlap {
 			return domain.NewError(domain.CodeLeaseConflict, "", false, "renewal overlaps another lease")
 		}
-		return tx.InsertLease(ctx, l)
+		return tx.UpdateLeaseUntil(ctx, token, until)
 	})
 }
 
