@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>冻干机蒸汽灭菌验证</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <header>
+    <h1>冻干机蒸汽灭菌验证与无菌放行</h1>
+    <p id="backend-state">正在连接后端…</p>
+  </header>
+  <main>
+    <section id="plan" aria-label="方案">
+      <h2>验证方案</h2>
+      <button id="lock-plan" type="button">锁定示例方案</button>
+      <button id="register-probe" type="button">注册示例探头</button>
+      <ul id="validation-list" class="list"></ul>
+    </section>
+    <section id="probes" aria-label="探头矩阵">
+      <h2>探头矩阵</h2>
+      <ul id="probe-list" class="list"></ul>
+    </section>
+    <section id="log" aria-label="操作记录">
+      <h2>操作记录</h2>
+      <ul id="action-log" class="list"></ul>
+    </section>
+  </main>
+  <script src="/app.js" type="module"></script>
+</body>
+</html>
