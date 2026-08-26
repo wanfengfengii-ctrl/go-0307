@@ -99,6 +99,15 @@ func (s *Service) Decide(ctx context.Context, cycleID domain.CycleID, d domain.F
 		return err
 	}
 
+	// An open retest blocks release before any other prerequisite is
+	// evaluated: a deviation promotes the cycle to a new retest generation,
+	// after which the prior generation's calculations no longer reflect the
+	// active state. Retest closure must therefore be established first, so
+	// that an open retest is reported as RETEST_OPEN rather than being masked
+	// by the incomplete-timeline or missing-sample checks.
+	if err := validateRetestClosed(deviations); err != nil {
+		return err.WithOperation(d.OperationID)
+	}
 	if status != domain.CycleComplete {
 		return domain.NewError(domain.CodeInvalidState, d.OperationID, false, "cycle timeline is not complete")
 	}
@@ -106,9 +115,6 @@ func (s *Service) Decide(ctx context.Context, cycleID domain.CycleID, d domain.F
 		return err.WithOperation(d.OperationID)
 	}
 	if err := validateIndicators(indicators); err != nil {
-		return err.WithOperation(d.OperationID)
-	}
-	if err := validateRetestClosed(deviations); err != nil {
 		return err.WithOperation(d.OperationID)
 	}
 	if err := validateReviews(reviews); err != nil {

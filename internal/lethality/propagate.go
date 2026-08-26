@@ -32,19 +32,21 @@ type positionInfo struct {
 // shared channel (same region), adjacent region (same region kind), shared
 // calibration batch and shared load layer — into one sorted, de-duplicated
 // retest set, and opens exactly one new generation per distinct summary.
+//
+// The snapshot read, propagation, summary, deviation/member insert and the
+// generation promotion all run inside one write transaction. This is essential:
+// the propagation summary depends on the bindings of the active generation, so
+// the source generation, the derived members and the snapshot promotion must
+// observe a single consistent state. Reading any of them outside the
+// transaction would race a concurrent OpenRetest that has already promoted the
+// generation, producing a divergent summary and a spurious second generation.
 func (s *Service) OpenRetest(ctx context.Context, req RetestRequest) (domain.Generation, error) {
 	if len(req.Sources) == 0 {
 		return 0, domain.NewError(domain.CodeInvalidPlan, req.OperationID, false, "retest requires at least one source")
 	}
 
-	var (
-		generation   domain.Generation
-		validationID domain.ValidationID
-		plan         domain.ValidationPlan
-		bindings     []domain.ProbeBinding
-		probes       []domain.ProbeLineage
-	)
-	err := s.store.Read(ctx, func(tx *store.Tx) error {
+	var retestGeneration domain.Generation
+	err := s.store.InTx(ctx, func(tx *store.Tx) error {
 		snap, err := tx.GetSnapshot(ctx, req.CycleID)
 		if errors.Is(err, store.ErrNotFound) {
 			return domain.NewError(domain.CodeNotFound, "", false, "cycle not found")
@@ -52,41 +54,46 @@ func (s *Service) OpenRetest(ctx context.Context, req RetestRequest) (domain.Gen
 		if err != nil {
 			return err
 		}
-		generation = snap.Generation
-		validationID = snap.ValidationID
+		generation := snap.Generation
 
-		plan, err = tx.GetPlan(ctx, validationID)
+		plan, err := tx.GetPlan(ctx, snap.ValidationID)
 		if err != nil {
 			return err
 		}
-		bindings, err = tx.ListBindings(ctx, generation)
+		bindings, err := tx.ListBindings(ctx, generation)
 		if err != nil {
 			return err
 		}
-		probes, err = tx.ListProbes(ctx)
-		return err
-	})
-	if err != nil {
-		return 0, err
-	}
+		probes, err := tx.ListProbes(ctx)
+		if err != nil {
+			return err
+		}
 
-	index := buildPositionIndex(plan, bindings, probes)
-	members := propagate(req.Sources, index)
-	summary := retestSummary(members)
+		index := buildPositionIndex(plan, bindings, probes)
+		members := propagate(req.Sources, index)
+		summary := retestSummary(members)
 
-	var retestGeneration domain.Generation
-	err = s.store.InTx(ctx, func(tx *store.Tx) error {
-		// A distinct summary maps to at most one retest generation.
+		// A distinct summary maps to at most one retest generation. In addition,
+		// once the snapshot has been promoted to a retest generation, any
+		// concurrent trigger of the same anomaly family must reuse that
+		// generation rather than open a new one: the retest members and summary
+		// are derived from the bindings of the *source* generation, which are
+		// no longer the snapshot's active generation after promotion, so the
+		// freshly computed summary would not match the stored one and a naive
+		// check would open a spurious second generation.
 		deviations, err := tx.ListDeviations(ctx, req.CycleID)
 		if err != nil {
 			return err
 		}
 		for _, d := range deviations {
-			if d.Propagation == summary {
+			if d.Propagation == summary || d.RetestGeneration == generation {
 				retestGeneration = d.RetestGeneration
-				return nil
+				// Make sure the cycle reports the generation this retest
+				// opened, even when a concurrent trigger won the race.
+				return promoteRetestGeneration(ctx, tx, snap, retestGeneration)
 			}
 		}
+
 		retestGeneration = generation + 1
 		dev := domain.DeviationCase{
 			ID:               domain.DeviationID("dev-" + summary[:16]),
@@ -103,7 +110,7 @@ func (s *Service) OpenRetest(ctx context.Context, req RetestRequest) (domain.Gen
 				existing, err := tx.GetDeviationByPropagation(ctx, req.CycleID, summary)
 				if err == nil {
 					retestGeneration = existing.RetestGeneration
-					return nil
+					return promoteRetestGeneration(ctx, tx, snap, retestGeneration)
 				}
 			}
 			return err
@@ -113,9 +120,32 @@ func (s *Service) OpenRetest(ctx context.Context, req RetestRequest) (domain.Gen
 				return err
 			}
 		}
-		return nil
+		// Advance the cycle projection to the retest generation so that the
+		// generation reported to the operator actually takes effect: subsequent
+		// stage/sample submissions with expected_generation=retestGeneration
+		// are accepted rather than rejected as a generation mismatch.
+		return promoteRetestGeneration(ctx, tx, snap, retestGeneration)
 	})
 	return retestGeneration, err
+}
+
+// promoteRetestGeneration upserts the cycle snapshot at the new retest
+// generation, preserving the validation id, cursor and status and recomputing
+// the checksum. It is a no-op when the snapshot already reports the target
+// generation (e.g. a concurrent OpenRetest won the race).
+func promoteRetestGeneration(ctx context.Context, tx *store.Tx, snap domain.CycleSnapshot, retestGeneration domain.Generation) error {
+	if snap.Generation == retestGeneration {
+		return nil
+	}
+	updated := domain.CycleSnapshot{
+		CycleID:      snap.CycleID,
+		ValidationID: snap.ValidationID,
+		Generation:   retestGeneration,
+		Cursor:       snap.Cursor,
+		Status:       domain.CycleDeviated,
+		Checksum:     domain.Checksum(snap.CycleID, snap.ValidationID, retestGeneration, snap.Cursor, domain.CycleDeviated),
+	}
+	return tx.SaveSnapshot(ctx, updated)
 }
 
 // RetestMembers returns the sorted, de-duplicated members of a retest set.
