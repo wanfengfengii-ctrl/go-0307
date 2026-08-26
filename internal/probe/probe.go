@@ -198,8 +198,10 @@ func (s *Service) Renew(ctx context.Context, token domain.TokenID, until domain.
 		if err != nil {
 			return err
 		}
-		if until <= l.ValidFrom {
-			return domain.NewError(domain.CodeNegativeInterval, "", false, "renewal endpoint before lease start")
+		// Renewal may only extend or keep the granted interval; a smaller
+		// endpoint would silently release the reserved trailing segment.
+		if until < l.ValidUntil {
+			return domain.NewError(domain.CodeNegativeInterval, "", false, "renewal endpoint shrinks granted lease interval")
 		}
 		overlap, err := tx.HasOverlappingLease(ctx, l.ResourceID, l.ValidUntil, until, token)
 		if err != nil {
