@@ -158,14 +158,31 @@ type LeaseRequest struct {
 }
 
 // Acquire grants a mutually exclusive lease, failing on interval overlap. The
-// token is deterministic so retries and tests are reproducible.
+// token is deterministic so retries and tests are reproducible. A retry that
+// carries the same operation id and lease interval returns the original token
+// instead of conflicting with the lease it already recorded, so a lost
+// response never deadlocks the acquisition flow.
 func (s *Service) Acquire(ctx context.Context, req LeaseRequest) (domain.TokenID, error) {
 	if req.ValidFrom >= req.ValidUntil {
 		return "", domain.NewError(domain.CodeNegativeInterval, req.OperationID, false, "lease interval must be non-empty")
 	}
 	token := domain.TokenID(domain.Digest("lease", req.ResourceID, req.OperationID, req.Generation, req.ValidFrom, req.ValidUntil)[:24])
+	requestDigest := domain.Digest("lease", req.ResourceID, req.Generation, req.ValidFrom, req.ValidUntil)
 
 	err := s.store.InTx(ctx, func(tx *store.Tx) error {
+		// Idempotent replay of the same operation returns the recorded token,
+		// so a retry after a lost response reuses its own lease rather than
+		// observing it as a conflict.
+		if rec, err := tx.GetIdempotency(ctx, req.OperationID); err == nil {
+			if rec.RequestDigest != requestDigest {
+				return domain.NewError(domain.CodeIdempotencyConflict, req.OperationID, false, "operation reused with different content")
+			}
+			token = domain.TokenID(rec.ResponseDigest)
+			return nil
+		} else if !errors.Is(err, store.ErrNotFound) {
+			return err
+		}
+
 		overlap, err := tx.HasOverlappingLease(ctx, req.ResourceID, req.ValidFrom, req.ValidUntil, "")
 		if err != nil {
 			return err
@@ -173,13 +190,20 @@ func (s *Service) Acquire(ctx context.Context, req LeaseRequest) (domain.TokenID
 		if overlap {
 			return domain.NewError(domain.CodeLeaseConflict, req.OperationID, false, "resource lease interval overlaps an existing lease")
 		}
-		return tx.InsertLease(ctx, domain.ResourceLease{
+		if err := tx.InsertLease(ctx, domain.ResourceLease{
 			ResourceID:  req.ResourceID,
 			OperationID: req.OperationID,
 			Generation:  req.Generation,
 			Token:       token,
 			ValidFrom:   req.ValidFrom,
 			ValidUntil:  req.ValidUntil,
+		}); err != nil {
+			return err
+		}
+		return tx.RecordIdempotency(ctx, domain.IdempotencyRecord{
+			OperationID:    req.OperationID,
+			RequestDigest:  requestDigest,
+			ResponseDigest: string(token),
 		})
 	})
 	if err != nil {
