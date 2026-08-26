@@ -69,6 +69,12 @@ func (s *Service) Sample(ctx context.Context, req SampleRequest) error {
 		if lease.ValidUntil <= sample.LogicalTime || lease.ValidFrom > sample.LogicalTime {
 			return domain.NewError(domain.CodeLeaseExpired, req.OperationID, false, "lease token expired at sample time")
 		}
+		// The token must be for the current generation: a lease acquired for an
+		// older generation does not authorize writes to this generation's
+		// evidence, even when it covers the same acquisition channel.
+		if lease.Generation != state.generation {
+			return domain.NewError(domain.CodeLeaseExpired, req.OperationID, false, "lease token is from a different generation")
+		}
 		binding, err := tx.FindBinding(ctx, sample.ProbeID, state.generation)
 		if errors.Is(err, store.ErrNotFound) {
 			return domain.NewError(domain.CodeInvalidState, req.OperationID, false, "probe is not bound for this generation")
