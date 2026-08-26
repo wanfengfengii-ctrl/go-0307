@@ -76,6 +76,13 @@ func (s *Service) Sample(ctx context.Context, req SampleRequest) error {
 		if err != nil {
 			return err
 		}
+		// The binding's logical-time interval must cover the sample moment. A
+		// binding that has expired (or not yet started) must not produce valid
+		// evidence, even when the channel lease outlives the binding and is
+		// still active at the sample time.
+		if binding.ValidUntil <= sample.LogicalTime || binding.ValidFrom > sample.LogicalTime {
+			return domain.NewError(domain.CodeLeaseExpired, req.OperationID, false, "probe binding does not cover sample time")
+		}
 		if lease.ResourceID != ChannelResource(binding.PositionID) {
 			return domain.NewError(domain.CodeLeaseExpired, req.OperationID, false, "lease token does not match probe channel")
 		}
