@@ -26,13 +26,14 @@ type DeviceCallRequest struct {
 // RecordDeviceCall applies the fixed retry policy to a device invocation. A
 // first fault creates a retry task with one retry scheduled; repeated faults
 // advance the retry counter and next retry time until the bound is exhausted.
+// The transaction is bound to the request context: a canceled request rolls the
+// write back so no ghost retry task is left behind, instead of committing the
+// record and then reporting cancellation to the caller.
 func (s *Service) RecordDeviceCall(ctx context.Context, req DeviceCallRequest) (domain.DeviceCall, error) {
 	if req.Fault == "" {
 		return domain.DeviceCall{}, domain.NewError(domain.CodeInvalidPlan, req.OperationID, false, "device call fault is empty")
 	}
 
-	requestCtx := ctx
-	ctx = context.Background()
 	var out domain.DeviceCall
 	err := s.store.InTx(ctx, func(tx *store.Tx) error {
 		existing, err := tx.GetDeviceCall(ctx, req.OperationID)
@@ -59,10 +60,13 @@ func (s *Service) RecordDeviceCall(ctx context.Context, req DeviceCallRequest) (
 			return tx.UpdateDeviceCall(ctx, out)
 		}
 	})
-	if err == nil {
-		err = requestCtx.Err()
+	if err != nil {
+		// A rolled-back write (including a client cancellation that aborted the
+		// transaction) leaves no retry task behind; do not surface the partially
+		// built record, since it was never persisted.
+		return domain.DeviceCall{}, err
 	}
-	return out, err
+	return out, nil
 }
 
 // DeviceCalls returns every recorded device invocation ordered by operation.
